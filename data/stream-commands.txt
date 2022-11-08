@@ -1,0 +1,43 @@
+CREATE STREAM str 
+( 
+    id VARCHAR KEY,
+    indicatorId INTEGER, 
+    name VARCHAR, 
+    target VARCHAR, 
+    status VARCHAR, 
+    runtime VARCHAR, 
+    score INTEGER, 
+    severity VARCHAR, 
+    weight INTEGER, 
+    category VARCHAR
+)
+WITH (VALUE_FORMAT = 'JSON', KAFKA_TOPIC = 'security_indicator_results', partitions = 1);
+
+INSERT INTO STREAM security_indicator_results 
+(
+    id,
+    indicatorId, 
+    name, 
+    target, 
+    status, 
+    runtime, 
+    score, 
+    severity, 
+    weight, 
+    category 
+);
+
+CREATE SOURCE TABLE tbl
+( 
+    id VARCHAR PRIMARY KEY,
+    indicatorId INTEGER, 
+    name VARCHAR, 
+    target VARCHAR, 
+    status VARCHAR, 
+    runtime VARCHAR, 
+    score INTEGER, 
+    severity VARCHAR, 
+    weight INTEGER, 
+    category VARCHAR
+)
+WITH (KAFKA_TOPIC = 'security_indicator_results', FORMAT = 'JSON', PARTITIONS = 1, REPLICAS = 1);

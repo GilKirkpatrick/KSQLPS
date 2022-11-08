@@ -19,25 +19,60 @@ Function Get-KsqlUrl {
     return $Url
 }
 
+Function Invoke-KsqlQuery {
+    [CmdletBinding(SupportsShouldProcess=$True)]
+    Param(
+        [Parameter(Mandatory=$True)][String]$Query,
+        [Parameter()][Hashtable]$StreamProperties = @{}
+    )
+
+    $Body = @{}
+    $Body.ksql = $Query
+    $Body.streamsProperties = $StreamProperties
+    $Body = $Body | ConvertTo-Json -Depth 5
+    $Body = [regex]::replace( # See https://stackoverflow.com/questions/47779157/convertto-json-and-convertfrom-json-with-special-characters
+        $Body, 
+        '(?<=(?:^|[^\\])(?:\\\\)*)\\u(00(?:26|27|3c|3e))', 
+        { param($match) [char] [int] ('0x' + $match.Groups[1].Value) },
+        'IgnoreCase'
+    )
+
+    $Url = Get-KsqlUrl query
+    
+    Write-Verbose "POST $Url"
+    Write-Verbose "$Body"
+    if($PSCmdlet.ShouldProcess($Url)){
+        Invoke-RestMethod -Uri $Url -Method POST -Body $Body -TransferEncoding chunked -ContentType 'application/json'
+    }
+}
+
 Function Invoke-KsqlCommand {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess=$True)]
     Param(
         [Parameter(Mandatory=$True)][String]$Command
     )
-    Try {
-		$Body = $BodyParameters | ConvertTo-JSON -Depth 6
-		Write-Verbose $Body
-		if($PSCmdlet.ShouldProcess($Uri)){
-			Invoke-RestMethod -Uri $Uri -Method $Method -Headers @{'Authorization'=$(Convert-CredentialToAuthHeader -Credential ($Connection.Credential))} -Body $Body
-		}
-	}
-	Catch {
-		return $null
-	}
+
+    $Body = @{}
+    $Body.ksql = $Command
+    $Body = $Body | ConvertTo-Json -Depth 5
+    $Body = [regex]::replace( # See https://stackoverflow.com/questions/47779157/convertto-json-and-convertfrom-json-with-special-characters
+        $Body, 
+        '(?<=(?:^|[^\\])(?:\\\\)*)\\u(00(?:26|27|3c|3e))', 
+        { param($match) [char] [int] ('0x' + $match.Groups[1].Value) },
+        'IgnoreCase'
+    )
+
+    $Url = Get-KsqlUrl ksql
+    
+    Write-Verbose "POST $Url"
+    Write-Verbose "$Body"
+    if($PSCmdlet.ShouldProcess($Url)){
+        Invoke-RestMethod -Uri $Url -Method POST -Body $Body -Headers @{'Accept'='application/vnd.ksql.v1+json'}
+    }
 }
 
 Function Add-KsqlStreamValue {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess=$True)]
     Param(
         [Parameter(Mandatory=$True)][String]$StreamName,
         [Parameter(ValueFromPipeline, ParameterSetName="Value")][Hashtable[]]$InputObject,
@@ -46,39 +81,106 @@ Function Add-KsqlStreamValue {
     )
 
     $InputObject.ForEach({
-        $Object = $_
-
         $Columns = @()
-        $Object.GetEnumerator().ForEach({
+        $_.GetEnumerator().ForEach({
             $Columns += $_.Name
         })
         $Columns = $Columns -join ','
-        Write-Verbose "Columns: $Columns"
 
         $Values = @()
-        $Object.GetEnumerator().ForEach({
+        $_.GetEnumerator().ForEach({
             $Values += "'$($_.Value)'"
         })
         $Values = $Values -join ','
-        Write-Verbose "Values: $Values"
         
-        $Body = @{}
-        $Body.ksql = "INSERT INTO $StreamName ($Columns) VALUES ($Values);"
-        $Body = $Body | ConvertTo-Json -EscapeHandling Default
-
-        $Url = Get-KsqlUrl ksql
-        
-        Write-Verbose "POST $Url"
-        Write-Verbose "$Body"
-        Invoke-RestMethod -Uri $Url -Method POST -Body $Body
+        $Command = "INSERT INTO $StreamName ($Columns) VALUES ($Values);"
+        Invoke-KsqlCommand $Command -Verbose:([bool]$PSBoundParameters['Verbose'].IsPresent) -WhatIf:([bool]$PSBoundParameters['WhatIf'].IsPresent)
     })
 }
 
 Function New-KsqlStream {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess=$True)]
     Param(
         [Parameter(Mandatory=$True)][String]$StreamName,
-        [Parameter(Mandatory=$True)][HashMap[]]$ColumnData,
-        [Parameter(Mandatory=$True)][String]$KeyColumnName
+        [Parameter(Mandatory=$True)][String[]]$ColumnData, # ColumnName:ColumnType e.g. Name:string,Size:int
+        [Parameter(Mandatory=$True)][String]$KeyColumnName,
+        [Parameter()][String]$TopicName,
+        [Parameter()][Switch]$Replace,
+        [Parameter()][Switch]$IfNotExists,
+        [Parameter()][Switch]$Source,
+        [Parameter()][Int]$PartitionCount = 1,
+        [Parameter()][String]$Format='JSON'
     )
+    $Script:FoundKeyColumn = $False
+    $Columns = @()
+    $ColumnData.ForEach({
+        if($_ -notmatch "^(?<column>\w+?):(?<type>(boolean|string|bytes|int|bigint|double|decimal|time|date|timestamp)$)") {
+            Throw "Format of column descriptor must be <column name>:<scalar type name>"
+        }
+        $Column = "$($Matches.column) $($Matches.type)"
+        if($KeyColumnName -eq $Matches.column) {
+            $Script:FoundKeyColumn = $True
+            $Column += " KEY"
+        }
+        $Columns += $Column
+    })
+    if(-not $Script:FoundKeyColumn) {
+        Throw "KeyColumnName not found in column descriptors"
+    }
+    if([String]::IsNullOrWhiteSpace($TopicName)){
+        $TopicName = $StreamName
+    }
+    $Command = "CREATE $(if($Replace) {"OR REPLACE "})$(if($Source){"SOURCE "})STREAM $(if($IfNotExists){"IF NOT EXISTS "}) $StreamName ($($Columns -join ',')) WITH (KAFKA_TOPIC='$TopicName',PARTITIONS=$PartitionCount,FORMAT='$Format');"
+    Invoke-KsqlCommand $Command -Verbose:([bool]$PSBoundParameters['Verbose'].IsPresent) -WhatIf:([bool]$PSBoundParameters['WhatIf'].IsPresent)
+}
+
+Function Remove-KsqlStream {
+    [CmdletBinding(SupportsShouldProcess=$True)]
+    Param(
+        [Parameter(Mandatory=$True)][String]$StreamName,
+        [Parameter()][Switch]$DeleteTopic
+    )
+
+    $Command = "DROP STREAM $StreamName"
+    if($DeleteTopic){
+        $Command += " DELETE TOPIC"
+    }
+    $Command += ';'
+    Invoke-KsqlCommand $Command -Verbose:([bool]$PSBoundParameters['Verbose'].IsPresent) -WhatIf:([bool]$PSBoundParameters['WhatIf'].IsPresent)
+}
+
+Function New-KsqlTable {
+    [CmdletBinding(SupportsShouldProcess=$True)]
+    Param(
+        [Parameter(Mandatory=$True)][String]$TableName,
+        [Parameter(Mandatory=$True)][String[]]$ColumnData, # ColumnName:ColumnType e.g. Name:string,Size:int
+        [Parameter(Mandatory=$True)][String]$KeyColumnName,
+        [Parameter()][String]$TopicName,
+        [Parameter()][Switch]$Replace,
+        [Parameter()][Switch]$IfNotExists,
+        [Parameter()][Switch]$Source,
+        [Parameter()][Int]$PartitionCount = 1,
+        [Parameter()][String]$Format='JSON'
+    )
+    $Script:FoundKeyColumn = $False
+    $Columns = @()
+    $ColumnData.ForEach({
+        if($_ -notmatch "^(?<column>\w+?):(?<type>(boolean|string|bytes|int|bigint|double|decimal|time|date|timestamp)$)") {
+            Throw "Format of column descriptor must be <column name>:<scalar type name>"
+        }
+        $Column = "$($Matches.column) $($Matches.type)"
+        if($KeyColumnName -eq $Matches.column) {
+            $Script:FoundKeyColumn = $True
+            $Column += " PRIMARY KEY"
+        }
+        $Columns += $Column
+    })
+    if(-not $Script:FoundKeyColumn) {
+        Throw "KeyColumnName not found in column descriptors"
+    }
+    if([String]::IsNullOrWhiteSpace($TopicName)){
+        $TopicName = $TableName
+    }
+    $Command = "CREATE $(if($Replace) {"OR REPLACE "})$(if($Source){"SOURCE "})TABLE $(if($IfNotExists){"IF NOT EXISTS "})$TableName ($($Columns -join ',')) WITH (KAFKA_TOPIC='$TopicName',PARTITIONS=$PartitionCount,FORMAT='$Format');"
+    Invoke-KsqlCommand $Command -Verbose:([bool]$PSBoundParameters['Verbose'].IsPresent) -WhatIf:([bool]$PSBoundParameters['WhatIf'].IsPresent)
 }
